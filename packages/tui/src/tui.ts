@@ -3,6 +3,8 @@
  */
 
 import { performance } from "node:perf_hooks";
+import { appendCopyParts, attachCopyParts, type CopyPart } from "./compact-copy.ts";
+import { getLayoutNode } from "./layout-node.ts";
 import { isKeyRelease, matchesKey } from "./keys.ts";
 import type { Terminal } from "./terminal.ts";
 import {
@@ -410,14 +412,18 @@ export class Container implements Component {
 
 	render(width: number): string[] {
 		const lines: string[] = [];
+		const copyParts: CopyPart[] = [];
 		const mouseChildren: Array<{ component: Component; height: number }> = [];
 		for (const child of this.children) {
 			const childLines = child.render(width);
+			// Nested scroll content has its own coordinate space, outside this bounded vertical slice.
+			if (getLayoutNode(child)?.type !== "scroll") appendCopyParts(copyParts, childLines, lines.length);
 			mouseChildren.push({ component: child, height: childLines.length });
 			for (const line of childLines) {
 				lines.push(line);
 			}
 		}
+		if (copyParts.length > 0) attachCopyParts(lines, copyParts);
 		this.mouseLayout = { width, children: mouseChildren };
 		return lines;
 	}
@@ -896,6 +902,19 @@ export abstract class TuiBase extends Container implements TUI {
 			}
 		}
 		return component;
+	}
+
+	/** Whether the last composed overlay rectangles intersect a terminal-relative region. */
+	protected hasRenderedOverlayIntersection(bounds: OverlayBounds): boolean {
+		if (bounds.width <= 0 || bounds.height <= 0) return false;
+		return this.renderedOverlayLayouts.some(
+			(layout) =>
+				layout.height > 0 &&
+				bounds.col < layout.col + layout.width &&
+				bounds.col + bounds.width > layout.col &&
+				bounds.row < layout.row + layout.height &&
+				bounds.row + bounds.height > layout.row,
+		);
 	}
 
 	/** Dispatch to the visually topmost overlay under the pointer. */

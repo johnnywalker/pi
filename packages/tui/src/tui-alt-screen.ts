@@ -4,6 +4,7 @@ import {
 	type AltScreenSearchMatch,
 	getAltScreenSearchMatchKey,
 } from "./alt-screen-search.ts";
+import { type CopyResolution, isMappedCopyRow, isTrustedCopyRow, resolveCopy, splitCopyMask } from "./compact-copy.ts";
 import { AltScreenFlashContainer } from "./components/alt-screen-flash.ts";
 import { ScrollView } from "./components/scroll-view.ts";
 import { getKeybindings } from "./keybindings.ts";
@@ -13,6 +14,7 @@ import {
 	getScrollbarGeometry,
 	getScrollViewBox,
 	getScrollViewsAt,
+	type LayoutBox,
 	type LayoutFrame,
 	renderLayoutFrame,
 	type ScrollbarGeometry,
@@ -204,6 +206,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 	readonly mode = "fullscreen" as const;
 	readonly [VIEWPORT_TUI] = true as const;
 	private previousScreen: string[] = [];
+	/** Composed transcript at currentLayout, before selection and transient flashes. */
+	private transcriptScreen: string[] = [];
 	private lastDocument: string[] = [];
 	private previousScreenWidth = 0;
 	private previousScreenHeight = 0;
@@ -495,6 +499,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 
 	protected override resetRenderState(): void {
 		this.previousScreen = [];
+		this.transcriptScreen = [];
 		this.previousScreenWidth = 0;
 		this.previousScreenHeight = 0;
 		this.currentLayout = undefined;
@@ -1391,7 +1396,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.stopSelectionAutoScroll();
 		this.selectionPressActive = true;
 		const scrollView =
-			!this.hasOverlay() && this.currentLayout
+			!this.hasRenderedOverlayIntersection({ row: event.y, col: event.x, width: 1, height: 1 }) && this.currentLayout
 				? getScrollViewsAt(this.currentLayout, event.x, event.y)[0]
 				: undefined;
 		const anchor = this.getSelectionPoint(event, scrollView);
@@ -1450,6 +1455,57 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		return { start: Math.max(minColumn, start), end: Math.min(maxColumn, end) };
 	}
 
+	private resolveTranscriptSelection(
+		sourceLines: readonly string[],
+		selection: SelectionRange,
+		screen: readonly string[],
+		box: LayoutBox,
+	): CopyResolution | undefined {
+		// Producer descriptors and final composed cells are separate trust boundaries. One untrusted row
+		// makes the entire selection use the original copy and rectangle-paint policy.
+		for (let row = selection.start.row; row <= selection.end.row; row++) {
+			if (!isTrustedCopyRow(sourceLines, row)) return undefined;
+		}
+		const firstRow = selection.start.row;
+		const lastRow = selection.end.row;
+		const firstLine = stripTerminalSequences(sourceLines[firstRow]);
+		const lastLine = stripTerminalSequences(sourceLines[lastRow]);
+		const start = this.getSelectionColumns(firstLine, firstRow, selection).start;
+		const end = this.getSelectionColumns(lastLine, lastRow, selection).end;
+		const resolution = resolveCopy(sourceLines, { row: firstRow, column: start }, { row: lastRow, column: end },
+			this.selectionGranularity === "line" ? "row" : "character");
+		// The child rectangle retains the rendered scroll translation; live scrollTop may already have advanced.
+		const contentOffset = -box.children[0]!.rect.y;
+		const minRow = Math.max(0, box.rect.y, box.clip.y);
+		const maxRow = Math.min(screen.length - 1, box.rect.y + box.rect.height - 1, box.clip.y + box.clip.height - 1);
+		const minColumn = Math.max(0, box.rect.x, box.clip.x);
+		const maxColumn = Math.min(this.terminal.columns, box.rect.x + box.rect.width, box.clip.x + box.clip.width);
+		const screenSelection = {
+			start: { ...selection.start, row: firstRow - contentOffset, col: box.rect.x + selection.start.col },
+			end: { ...selection.end, row: lastRow - contentOffset, col: box.rect.x + selection.end.col },
+		};
+		for (let row = Math.max(firstRow, minRow + contentOffset); row <= Math.min(lastRow, maxRow + contentOffset); row++) {
+			const screenRow = row - contentOffset;
+			const painted = screen[screenRow] ?? "";
+			// Overlay overlap must include selected margins, not just the canonical glyph mask.
+			const selectedColumns = this.getSelectionColumns(painted, screenRow, screenSelection, minColumn, maxColumn);
+			if (this.hasRenderedOverlayIntersection({
+				row: screenRow, col: selectedColumns.start, width: selectedColumns.end - selectedColumns.start, height: 1,
+			})) return undefined;
+			const mask = resolution.masks.find((mask) => mask.row === row);
+			// Rows without canonical glyphs still must not hide replacement content in the dragged range.
+			const source = stripTerminalSequences(sourceLines[row]);
+			const columns = mask ? { start: mask.x0, end: mask.x1 } : this.getSelectionColumns(source, row, selection);
+			const left = Math.max(minColumn, box.rect.x + columns.start);
+			const right = Math.min(maxColumn, box.rect.x + columns.end);
+			if (right <= left) continue;
+			if (isImageLine(painted) ||
+				sliceByColumn(source, left - box.rect.x, right - left, true) !==
+				sliceByColumn(stripTerminalSequences(painted), left, right - left, true)) return undefined;
+		}
+		return resolution;
+	}
+
 	private getActiveSelectionText(): string | undefined {
 		const selection = this.getSelectionBounds();
 		if (!selection) return undefined;
@@ -1459,6 +1515,8 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			const box = getScrollViewBox(this.currentLayout, selection.start.scrollView);
 			if (!box?.scrollContentLines) return undefined;
 			sourceLines = box.scrollContentLines;
+			const resolution = this.resolveTranscriptSelection(sourceLines, selection, this.transcriptScreen, box);
+			if (resolution) return resolution.text.length === 0 ? undefined : resolution.text;
 		}
 		const lines: string[] = [];
 		for (let row = selection.start.row; row <= selection.end.row; row++) {
@@ -1607,6 +1665,10 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		let maxRow = screen.length - 1;
 		let minColumn = 0;
 		let maxColumn = this.terminal.columns;
+		let copySource: readonly string[] | undefined;
+		let copyMasks: CopyResolution["masks"] | undefined;
+		let contentOffset = 0;
+		let columnOffset = 0;
 		if (selection.start.scrollView) {
 			if (!layout) return screen;
 			const box = getScrollViewBox(layout, selection.start.scrollView);
@@ -1615,15 +1677,24 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 			maxRow = Math.min(screen.length - 1, box.rect.y + box.rect.height - 1, box.clip.y + box.clip.height - 1);
 			minColumn = Math.max(0, box.rect.x, box.clip.x);
 			maxColumn = Math.min(this.terminal.columns, box.rect.x + box.rect.width, box.clip.x + box.clip.width);
+			contentOffset = -box.children[0]!.rect.y;
+			if (box.scrollContentLines) {
+				const resolution = this.resolveTranscriptSelection(box.scrollContentLines, selection, screen, box);
+				if (resolution) {
+					copySource = box.scrollContentLines;
+					columnOffset = box.rect.x;
+					copyMasks = resolution.masks;
+				}
+			}
 			screenSelection = {
 				start: {
 					...selection.start,
-					row: box.rect.y + selection.start.row - selection.start.scrollView.scrollTop,
+					row: selection.start.row - contentOffset,
 					col: box.rect.x + selection.start.col,
 				},
 				end: {
 					...selection.end,
-					row: box.rect.y + selection.end.row - selection.start.scrollView.scrollTop,
+					row: selection.end.row - contentOffset,
 					col: box.rect.x + selection.end.col,
 				},
 			};
@@ -1639,8 +1710,16 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 				return line;
 			}
 			const lineWidth = visibleWidth(line);
-			const columns = this.getSelectionColumns(line, row, screenSelection, minColumn, maxColumn);
+			const mask = copyMasks?.find((mask) => mask.row === row + contentOffset);
+			if (copyMasks && !mask) return line;
+			const columns = mask
+				? { start: Math.max(minColumn, columnOffset + mask.x0), end: Math.min(maxColumn, columnOffset + mask.x1) }
+				: this.getSelectionColumns(line, row, screenSelection, minColumn, maxColumn);
 			if (columns.end <= columns.start) return line;
+			if (copySource && isMappedCopyRow(copySource, row + contentOffset)) {
+				const { before, selected, after } = splitCopyMask(line, { row, x0: columns.start, x1: columns.end });
+				return `${before}${this.applySelectionHighlight(selected)}${after}`;
+			}
 			const before = sliceByColumn(line, 0, columns.start, true);
 			const selected = sliceByColumn(line, columns.start, columns.end - columns.start, true);
 			const after = sliceByColumn(line, columns.end, Math.max(0, lineWidth - columns.end), true);
@@ -1705,6 +1784,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		screen = this.compositeScrollToEndIndicator(screen, nextLayout, width);
 		screen = this.compositeOverlays(screen, width, height);
 		if (screen.length > height) screen = screen.slice(screen.length - height);
+		const transcriptScreen = screen;
 		screen = this.applySelection(screen, nextLayout);
 		screen = this.compositeFlashes(screen, width, height);
 
@@ -1793,6 +1873,7 @@ export class TuiAltScreen extends TuiBase implements ViewportTUI {
 		this.terminal.write(buffer);
 
 		this.previousScreen = screen;
+		this.transcriptScreen = transcriptScreen;
 		this.previousScreenWidth = width;
 		this.previousScreenHeight = height;
 		this.currentLayout = nextLayout;

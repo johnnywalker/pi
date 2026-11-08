@@ -1,5 +1,6 @@
+import { attachCopyParts, type CopyBlock, type CopyRows } from "../compact-copy.ts";
 import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { applyBackgroundToLine, flattenLines, stripTerminalSequences, visibleWidth, wrapTextWithAnsi, type WrapTraceRow } from "../utils.ts";
 
 /**
  * Text component - displays multi-line text with word wrapping
@@ -14,6 +15,7 @@ export class Text implements Component {
 	private cachedText?: string;
 	private cachedWidth?: number;
 	private cachedLines?: string[];
+	private copyBlock?: CopyBlock;
 
 	constructor(text: string = "", paddingX: number = 1, paddingY: number = 1, customBgFn?: (text: string) => string) {
 		this.text = text;
@@ -26,6 +28,7 @@ export class Text implements Component {
 		// Renderers often set the same text on every update; keep the wrapped lines then.
 		if (text === this.text) return;
 		this.text = text;
+		this.copyBlock = undefined;
 		this.cachedText = undefined;
 		this.cachedWidth = undefined;
 		this.cachedLines = undefined;
@@ -72,7 +75,10 @@ export class Text implements Component {
 		const contentWidth = Math.max(1, width - paddingX * 2);
 
 		// Wrap text (this preserves ANSI codes but does NOT pad)
-		const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth);
+		const trace: WrapTraceRow[] = [];
+		const wrappedLines = wrapTextWithAnsi(normalizedText, contentWidth, trace);
+		const canonical = stripTerminalSequences(normalizedText).replace(/\r\n|\r/g, "\n");
+		if (this.copyBlock?.text !== canonical) this.copyBlock = { text: canonical };
 
 		// Add margins and background to each line
 		const leftMargin = " ".repeat(paddingX);
@@ -104,6 +110,22 @@ export class Text implements Component {
 
 		const result = [...emptyLines, ...contentLines, ...emptyLines];
 		flattenLines(result);
+		const rows: CopyRows = {
+			source: this.copyBlock,
+			runs: trace.map((row, i) => ({
+				...row,
+				paint: contentLines[i],
+				x0: paddingX,
+				x1: paddingX + visibleWidth(wrappedLines[i]),
+				continuity: 0,
+			})),
+		};
+		const spacing: CopyRows = { source: { text: "" }, runs: emptyLines.map(() => undefined), spacingPaint: emptyLines };
+		attachCopyParts(result, [
+			{ rowStart: 0, rows: spacing },
+			{ rowStart: emptyLines.length, rows },
+			{ rowStart: emptyLines.length + contentLines.length, rows: spacing },
+		]);
 
 		// Update cache
 		this.cachedText = this.text;

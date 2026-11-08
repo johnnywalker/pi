@@ -1,9 +1,10 @@
 import { Marked, type Token, Tokenizer, type TokenizerExtension, type Tokens, type TokensList } from "marked";
 import markedCjkFriendly from "marked-cjk-friendly";
+import { attachCopyParts, type CopyPart, type CopyRows, type CopyRun } from "../compact-copy.ts";
 import { renderLatex } from "../latex.ts";
 import { getCapabilities, hyperlink, isImageLine } from "../terminal-image.ts";
 import type { Component } from "../tui.ts";
-import { applyBackgroundToLine, cjkPunctuationRegex, flattenLines, visibleWidth, wrapTextWithAnsi } from "../utils.ts";
+import { applyBackgroundToLine, cjkPunctuationRegex, flattenLines, stripTerminalSequences, visibleWidth, wrapTextWithAnsi, type WrapTraceRow } from "../utils.ts";
 
 const STRICT_STRIKETHROUGH_REGEX = /^(~~)(?=[^\s~])((?:\\.|[^\\])*?(?:\\.|[^\s~\\]))\1(?=[^~]|$)/;
 
@@ -266,12 +267,19 @@ interface InlineStyleContext {
 	stylePrefix: string;
 }
 
+interface ListCopyTrace {
+	canonicalLines: string[];
+	runs: CopyRun[];
+}
+
 /** A top-level block of the last render, keyed by its source, reused by the next render. */
 interface RenderedBlock {
 	/** Width and type of the following block (which decides the spacing) that the lines were rendered for. */
 	width: number;
 	nextTokenType: string | undefined;
 	lines: string[];
+	/** Experimental paragraph/code/flat-list/separator provenance, local to this block's rendered text revision. */
+	copyRows?: CopyRows;
 	/** Highlighted lines of the block's code, keyed by language and source; they survive a resize or new spacing. */
 	highlightedCode: Map<string, string[]>;
 }
@@ -375,15 +383,17 @@ export class Markdown implements Component {
 		const blocks = new Map<string, RenderedBlock>();
 		this.blocks = new WeakRef(blocks);
 		const contentLines: string[] = [];
+		const copyParts: CopyPart[] = [];
 		for (let i = 0; i < tokens.length; i++) {
 			const token = tokens[i];
 			const nextTokenType = tokens[i + 1]?.type;
 			const reused = reuseBlocks ? (blocks.get(token.raw) ?? previousBlocks?.get(token.raw)) : undefined;
-			const block = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
+			const block: RenderedBlock = reused ?? { width: -1, nextTokenType, lines: [], highlightedCode: new Map() };
 			if (block.width !== width || block.nextTokenType !== nextTokenType) {
 				this.renderBlock(block, token, nextTokenType, width, contentWidth);
 			}
 			if (reuseBlocks) blocks.set(token.raw, block);
+			if (block.copyRows) copyParts.push({ rowStart: this.paddingY + contentLines.length, rows: block.copyRows });
 			for (const line of block.lines) {
 				contentLines.push(line);
 			}
@@ -401,6 +411,12 @@ export class Markdown implements Component {
 
 		// Combine top padding, content, and bottom padding
 		const result = emptyLines.concat(contentLines, emptyLines);
+		const spacing: CopyRows = { source: { text: "" }, runs: emptyLines.map(() => undefined), spacingPaint: emptyLines };
+		attachCopyParts(result, [
+			{ rowStart: 0, rows: spacing },
+			...copyParts,
+			{ rowStart: emptyLines.length + contentLines.length, rows: spacing },
+		]);
 
 		// Update cache
 		this.cachedText = this.text;
@@ -423,12 +439,34 @@ export class Markdown implements Component {
 		const rightMargin = " ".repeat(this.paddingX);
 		const bgFn = this.defaultTextStyle?.bgColor;
 		const lines: string[] = [];
-		for (const line of this.renderToken(token, contentWidth, nextTokenType)) {
+		// Flat single-block items have one unambiguous canonical body per visible marker.
+		let listCopy: ListCopyTrace | undefined = token.type === "list" && token.items.every(
+			(item: Tokens.ListItem) => item.tokens.length === 1 && (item.tokens[0].type === "text" || item.tokens[0].type === "paragraph"),
+		) ? { canonicalLines: [], runs: [] } : undefined;
+		const runs: (CopyRun | undefined)[] = [];
+		const canonicalLines: string[] = [];
+		let offset = 0;
+		const rendered = listCopy
+			? this.renderList(token as Tokens.List, 0, contentWidth, undefined, listCopy)
+			: this.renderToken(token, contentWidth, nextTokenType);
+		// Overwide markers/glyphs can be rewrapped by the outer renderer; keep those lists on baseline fallback.
+		if (listCopy && rendered.some((line) => visibleWidth(line) > contentWidth)) listCopy = undefined;
+		const supported = token.type === "paragraph" || token.type === "heading" || token.type === "code" || token.type === "space" || listCopy !== undefined;
+		const semanticLineCount = token.type === "paragraph" || token.type === "heading" || token.type === "space" ? 1 : token.type === "code" ? rendered.length - (nextTokenType && nextTokenType !== "space" ? 1 : 0) : 0;
+		for (let lineIndex = 0; lineIndex < rendered.length; lineIndex++) {
+			const line = rendered[lineIndex];
+			const semantic = supported && lineIndex < semanticLineCount;
+			const plain = semantic ? stripTerminalSequences(line).replace(/\r\n|\r/g, "\n") : "";
+			const prefix = semantic && token.type === "code" && lineIndex > 0 && lineIndex < semanticLineCount - 1 ? stripTerminalSequences(this.theme.codeBlockIndent ?? "  ").length : 0;
+			if (semantic) canonicalLines.push(plain.slice(prefix));
 			if (isImageLine(line)) {
 				lines.push(line);
 				continue;
 			}
-			for (const wrappedLine of wrapTextWithAnsi(line, contentWidth)) {
+			const trace: WrapTraceRow[] | undefined = semantic ? [] : undefined;
+			const wrapped = wrapTextWithAnsi(line, contentWidth, trace);
+			for (let wrappedIndex = 0; wrappedIndex < wrapped.length; wrappedIndex++) {
+				const wrappedLine = wrapped[wrappedIndex];
 				const lineWithMargins = leftMargin + wrappedLine + rightMargin;
 				if (bgFn) {
 					lines.push(applyBackgroundToLine(lineWithMargins, width, bgFn));
@@ -437,7 +475,34 @@ export class Markdown implements Component {
 					const paddingNeeded = Math.max(0, width - visibleWidth(lineWithMargins));
 					lines.push(lineWithMargins + " ".repeat(paddingNeeded));
 				}
+				const listRow = listCopy?.runs[lineIndex];
+				const row = trace?.[wrappedIndex];
+				if (listRow) {
+					runs.push({ ...listRow, paint: lines[lines.length - 1], x0: this.paddingX + listRow.x0, x1: this.paddingX + listRow.x1 });
+				} else if (row) {
+					const skippedPrefix = plain.slice(row.visibleStart, Math.min(prefix, row.visibleEnd));
+					runs.push({
+						visibleStart: offset + Math.max(0, row.visibleStart - prefix),
+						visibleEnd: offset + Math.max(0, row.visibleEnd - prefix),
+						anchorStart: offset + Math.max(0, row.anchorStart - prefix),
+						anchorEnd: offset + Math.max(0, row.anchorEnd - prefix) + (wrappedIndex + 1 === wrapped.length && lineIndex + 1 < semanticLineCount ? 1 : 0),
+						paint: lines[lines.length - 1],
+						x0: this.paddingX + visibleWidth(skippedPrefix),
+						x1: this.paddingX + visibleWidth(wrappedLine),
+						continuity: 0,
+					});
+				} else if (supported) {
+					runs.push(undefined);
+				}
 			}
+			if (semantic) offset += plain.length - prefix + 1;
+		}
+		if (supported) {
+			const text = (listCopy?.canonicalLines ?? canonicalLines).join("\n");
+			const source = block.copyRows?.source.text === text ? block.copyRows.source : { text };
+			block.copyRows = { source, runs, spacingPaint: lines };
+		} else {
+			block.copyRows = undefined;
 		}
 		this.blockHighlightedCode = undefined;
 		flattenLines(lines);
@@ -858,8 +923,9 @@ export class Markdown implements Component {
 	/**
 	 * Render a list with proper nesting support
 	 */
-	private renderList(token: Tokens.List, depth: number, width: number, styleContext?: InlineStyleContext): string[] {
+	private renderList(token: Tokens.List, depth: number, width: number, styleContext?: InlineStyleContext, copyTrace?: ListCopyTrace): string[] {
 		const lines: string[] = [];
+		let copyOffset = 0;
 		const indent = "    ".repeat(depth);
 		// Use the list's start property (defaults to 1 for ordered lists)
 		const startNumber = typeof token.start === "number" ? token.start : 1;
@@ -879,6 +945,7 @@ export class Markdown implements Component {
 			const firstPrefix = indent + this.theme.listBullet(marker);
 			const continuationPrefix = indent + " ".repeat(visibleWidth(marker));
 			const itemWidth = Math.max(1, width - visibleWidth(firstPrefix));
+			const copyMarker = copyTrace ? stripTerminalSequences(firstPrefix) : "";
 			let renderedAnyLine = false;
 
 			for (const itemToken of item.tokens) {
@@ -890,11 +957,32 @@ export class Markdown implements Component {
 
 				const itemLines = this.renderToken(itemToken, itemWidth, undefined, styleContext);
 				for (const line of itemLines) {
-					for (const wrappedLine of wrapTextWithAnsi(line, itemWidth)) {
+					const trace: WrapTraceRow[] | undefined = copyTrace ? [] : undefined;
+					const wrapped = wrapTextWithAnsi(line, itemWidth, trace);
+					const plain = copyTrace ? stripTerminalSequences(line).replace(/\r\n|\r/g, "\n") : "";
+					copyTrace?.canonicalLines.push(copyMarker + plain);
+					for (let wrappedIndex = 0; wrappedIndex < wrapped.length; wrappedIndex++) {
+						const wrappedLine = wrapped[wrappedIndex];
 						const linePrefix = renderedAnyLine ? continuationPrefix : firstPrefix;
-						lines.push(linePrefix + wrappedLine);
+						const paint = linePrefix + wrappedLine;
+						const row = trace?.[wrappedIndex];
+						if (copyTrace && row) {
+							const markerLength = copyMarker.length;
+							copyTrace.runs.push({
+								visibleStart: copyOffset + (renderedAnyLine ? markerLength + row.visibleStart : 0),
+								visibleEnd: copyOffset + markerLength + row.visibleEnd,
+								anchorStart: copyOffset + (renderedAnyLine ? markerLength + row.anchorStart : 0),
+								anchorEnd: copyOffset + markerLength + row.anchorEnd + (wrappedIndex + 1 === wrapped.length && !isLastItem ? 1 : 0),
+								paint,
+								x0: renderedAnyLine ? visibleWidth(continuationPrefix) : 0,
+								x1: visibleWidth(paint),
+								continuity: 0,
+							});
+						}
+						lines.push(paint);
 						renderedAnyLine = true;
 					}
+					if (copyTrace) copyOffset += copyMarker.length + plain.length + 1;
 				}
 			}
 
@@ -904,6 +992,20 @@ export class Markdown implements Component {
 
 			if (token.loose && !isLastItem) {
 				lines.push("");
+				if (copyTrace) {
+					copyTrace.runs.push({
+						visibleStart: copyOffset,
+						visibleEnd: copyOffset,
+						anchorStart: copyOffset,
+						anchorEnd: copyOffset + 1,
+						paint: "",
+						x0: 0,
+						x1: 0,
+						continuity: 0,
+					});
+					copyTrace.canonicalLines.push("");
+					copyOffset++;
+				}
 			}
 		}
 

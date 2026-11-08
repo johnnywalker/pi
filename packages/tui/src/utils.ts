@@ -835,6 +835,40 @@ function updateTrackerFromText(text: string, tracker: AnsiCodeTracker): void {
 	}
 }
 
+/** Return only inverse replay for selection suffixes, without changing the renderer's legacy SGR tracking. */
+export function getActiveInverseAnsi(text: string): string {
+	let inverse = false;
+	let i = text.indexOf("\x1b");
+	while (i !== -1) {
+		const ansi = extractAnsiCode(text, i);
+		if (!ansi) {
+			i++;
+		} else {
+			const sgr = /^\x1b\[([\d;:]*)m$/.exec(ansi.code);
+			if (sgr) {
+				const groups = sgr[1].split(";");
+				for (let group = 0; group < groups.length; group++) {
+					// Colon subparameters are indivisible: color values and empty slots are not SGR commands.
+					if (groups[group].includes(":")) continue;
+					const code = Number(groups[group]);
+					if (code === 38 || code === 48 || code === 58) {
+						const mode = Number(groups[group + 1]);
+						if (mode === 5) group += 2;
+						else if (mode === 2) group += 4;
+					} else if (code === 0 || code === 27) {
+						inverse = false;
+					} else if (code === 7) {
+						inverse = true;
+					}
+				}
+			}
+			i += ansi.length;
+		}
+		i = text.indexOf("\x1b", i);
+	}
+	return inverse ? "\x1b[7m" : "";
+}
+
 /** Return only the background color active at the end of an ANSI-styled string. */
 export function getActiveBackgroundAnsi(text: string): string {
 	const tracker = new AnsiCodeTracker();
@@ -950,8 +984,17 @@ export function flattenLines(lines: readonly string[]): void {
 	for (const line of lines) Number(line);
 }
 
-export function wrapTextWithAnsi(text: string, width: number): string[] {
+/** Optional wrapper trace: UTF-16 offsets in ANSI-stripped, newline-normalized input. */
+export interface WrapTraceRow {
+	visibleStart: number;
+	visibleEnd: number;
+	anchorStart: number;
+	anchorEnd: number;
+}
+
+export function wrapTextWithAnsi(text: string, width: number, trace?: WrapTraceRow[]): string[] {
 	if (!text) {
+		trace?.push({ visibleStart: 0, visibleEnd: 0, anchorStart: 0, anchorEnd: 0 });
 		return [""];
 	}
 
@@ -960,11 +1003,27 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 	const inputLines = text.split(/\r\n|\r|\n/);
 	const result: string[] = [];
 	const tracker = new AnsiCodeTracker();
+	let offset = 0;
 
-	for (const inputLine of inputLines) {
+	for (let inputIndex = 0; inputIndex < inputLines.length; inputIndex++) {
+		const inputLine = inputLines[inputIndex];
 		// Prepend active ANSI codes from previous lines (except for first line)
 		const prefix = result.length > 0 ? tracker.getActiveCodes() : "";
-		const wrappedLines = wrapSingleLine(prefix + inputLine, width);
+		const traceStart = trace?.length ?? 0;
+		const wrappedLines = wrapSingleLine(prefix + inputLine, width, trace, offset);
+		if (trace) {
+			const end = offset + stripTerminalSequences(inputLine).length;
+			const nextOffset = end + (inputIndex + 1 < inputLines.length ? 1 : 0);
+			for (let i = traceStart; i < trace.length; i++) {
+				trace[i].anchorEnd = i + 1 < trace.length ? trace[i + 1].visibleStart : nextOffset;
+				// A fully elided logical row anchors its hard newline after the omitted whitespace.
+				if (trace.length - traceStart === 1 && trace[i].visibleStart === trace[i].visibleEnd) {
+					trace[i].visibleStart = end;
+					trace[i].visibleEnd = end;
+				}
+			}
+			offset = nextOffset;
+		}
 		for (const wrappedLine of wrappedLines) {
 			result.push(wrappedLine);
 		}
@@ -975,13 +1034,12 @@ export function wrapTextWithAnsi(text: string, width: number): string[] {
 	return result.length > 0 ? result : [""];
 }
 
-function wrapSingleLine(line: string, width: number): string[] {
-	if (!line) {
-		return [""];
-	}
-
-	const visibleLength = visibleWidth(line);
-	if (visibleLength <= width) {
+function wrapSingleLine(line: string, width: number, trace?: WrapTraceRow[], offset = 0): string[] {
+	if (!line || visibleWidth(line) <= width) {
+		if (trace) {
+			const end = offset + stripTerminalSequences(line).length;
+			trace.push({ visibleStart: offset, visibleEnd: end, anchorStart: offset, anchorEnd: end });
+		}
 		return [line];
 	}
 
@@ -991,8 +1049,18 @@ function wrapSingleLine(line: string, width: number): string[] {
 
 	let currentLine = "";
 	let currentVisibleLength = 0;
+	let sourcePosition = offset;
+	let rowStart = offset;
+	let rowAnchor = offset;
+	const record = (paint: string, start: number): void => {
+		if (!trace) return;
+		const end = start + stripTerminalSequences(paint.trimEnd()).length;
+		trace.push({ visibleStart: start, visibleEnd: end, anchorStart: rowAnchor, anchorEnd: end });
+	};
 
 	for (const token of tokens) {
+		const tokenStart = sourcePosition;
+		if (trace) sourcePosition += stripTerminalSequences(token).length;
 		const tokenVisibleLength = visibleWidth(token);
 		const isWhitespace = isWhitespaceToken(token);
 
@@ -1007,14 +1075,20 @@ function wrapSingleLine(line: string, width: number): string[] {
 					currentLine += lineEndReset;
 				}
 				wrapped.push(currentLine);
+				record(currentLine, rowStart);
 				currentLine = "";
 				currentVisibleLength = 0;
 			}
 
 			// Break long token - breakLongWord handles its own resets
 			const broken = breakLongWord(token, width, tracker);
+			rowStart = tokenStart;
+			rowAnchor = rowStart;
 			for (let i = 0; i < broken.length - 1; i++) {
 				wrapped.push(broken[i]!);
+				record(broken[i]!, rowStart);
+				if (trace) rowStart += stripTerminalSequences(broken[i]!).length;
+				rowAnchor = rowStart;
 			}
 			currentLine = broken[broken.length - 1];
 			currentVisibleLength = visibleWidth(currentLine);
@@ -1038,6 +1112,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 				lineToWrap += lineEndReset;
 			}
 			wrapped.push(lineToWrap);
+			record(lineToWrap, rowStart);
+			rowStart = isWhitespace ? sourcePosition : tokenStart;
+			rowAnchor = rowStart;
 			if (isWhitespace) {
 				// Don't start new line with whitespace
 				currentLine = tracker.getActiveCodes();
@@ -1050,6 +1127,8 @@ function wrapSingleLine(line: string, width: number): string[] {
 			// Whitespace wider than an empty line. Plain spaces are removed by the final trimEnd(), but codes after
 			// them (e.g. a trailing reset) would block that and leave the line wider than width. Keep only the codes.
 			currentLine += extractAnsiCodes(token);
+			// Elision advances visible text, but whole-row copying still owns the leading indentation.
+			if (trace && currentVisibleLength === 0) rowStart = sourcePosition;
 		} else {
 			// Add to current line
 			currentLine += token;
@@ -1062,7 +1141,9 @@ function wrapSingleLine(line: string, width: number): string[] {
 	if (currentLine) {
 		// No reset at end of final line - let caller handle it
 		wrapped.push(currentLine);
+		record(currentLine, rowStart);
 	}
+	if (trace && wrapped.length === 0) record("", rowStart);
 
 	// Trailing whitespace can cause lines to exceed the requested width
 	return wrapped.length > 0 ? wrapped.map((line) => line.trimEnd()) : [""];
